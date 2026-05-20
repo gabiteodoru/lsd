@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""
+Token-windowed chat.
+
+Commands:
+  window <n>   set sliding window size in tokens (0 = disabled, uses KV cache)
+  clear        wipe conversation history and start fresh
+  quit         exit
+  <anything else>  send as next user message
+"""
+
+import sys
+import argparse
+import torch
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
+DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_WINDOW = 0
+DEFAULT_MAX_NEW = 512
+TEMPERATURE = 0.7
+SYSTEM_PROMPT = "You are a helpful assistant. Think through problems carefully and step by step."
+
+
+@dataclass
+class Token:
+    id: int
+    role: str  # "system" | "user" | "assistant" | "template"
+
+
+class Chat:
+    def __init__(self, model_name: str, window_size: int, log_path: Path):
+        self.window_size = window_size  # 0 means no window (use cache)
+        self.tokens: List[Token] = []
+        self.messages: List[dict] = []
+        self._past_key_values = None
+        self._log = open(log_path, "a")
+        self._log.write(f"\n=== session {datetime.now().isoformat()} ===\n")
+        self._log.flush()
+        self._load(model_name)
+        self._add_message("system", SYSTEM_PROMPT)
+
+    def _load(self, model_name: str):
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
+        use_4bit = vram_gb < 40
+        print(f"Loading {model_name} — VRAM: {vram_gb:.0f}GB, mode: {'4-bit quant' if use_4bit else 'bfloat16'} ...", flush=True)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            if use_4bit:
+                bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name, quantization_config=bnb, device_map="auto",
+                    low_cpu_mem_usage=True,
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name, torch_dtype=torch.bfloat16, device_map="auto",
+                    low_cpu_mem_usage=True,
+                )
+            self.model.eval()
+        except Exception as e:
+            print(f"ERROR loading model: {e}", file=sys.stderr)
+            raise
+        gc = self.model.generation_config
+        stop = gc.eos_token_id if gc.eos_token_id is not None else self.tokenizer.eos_token_id
+        self.stop_ids = set(stop if isinstance(stop, list) else [stop])
+        print(f"Ready. stop_ids={self.stop_ids}\n")
+
+    def _tokenize_messages(self, messages: List[dict], add_generation_prompt: bool = False) -> List[int]:
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=add_generation_prompt
+        )
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def _add_message(self, role: str, content: str):
+        before = self._tokenize_messages(self.messages)
+        self.messages.append({"role": role, "content": content})
+        after = self._tokenize_messages(self.messages)
+        self.tokens += [Token(id=i, role=role) for i in after[len(before):]]
+
+    def _add_generation_prompt(self):
+        before = self._tokenize_messages(self.messages)
+        after = self._tokenize_messages(self.messages, add_generation_prompt=True)
+        self.tokens += [Token(id=i, role="template") for i in after[len(before):]]
+
+    def _log_turn(self, role: str, text: str):
+        self._log.write(f"\n[{role}] {datetime.now().isoformat()}\n{text}\n")
+        self._log.flush()
+
+    def add_user(self, text: str):
+        self._log_turn("user", text)
+        self._add_message("user", text)
+        self._add_generation_prompt()
+
+    def _close_assistant_turn(self, content: str):
+        self.messages.append({"role": "assistant", "content": content})
+        before = self._tokenize_messages(self.messages[:-1], add_generation_prompt=True)
+        after = self._tokenize_messages(self.messages)
+        content_ids = self.tokenizer.encode(content, add_special_tokens=False)
+        closing_ids = after[len(before) + len(content_ids):]
+        self.tokens += [Token(id=i, role="template") for i in closing_ids]
+
+    def _context_ids(self) -> List[int]:
+        ids = [t.id for t in self.tokens]
+        return ids if self.window_size == 0 else ids[-self.window_size:]
+
+    def generate(self, max_new: int = DEFAULT_MAX_NEW) -> tuple[int, int]:
+        gen_start = len(self.tokens)
+        generated_ids = []
+        use_cache = self.window_size == 0
+        print("\n[assistant]", flush=True)
+
+        if use_cache and self._past_key_values is not None:
+            # Feed only the new tokens since last generation
+            new_ids = [t.id for t in self.tokens[self._cache_len:]]
+            input_ids = torch.tensor([new_ids], device=self.model.device)
+            past = self._past_key_values
+        else:
+            input_ids = torch.tensor([self._context_ids()], device=self.model.device)
+            past = None
+
+        for step in range(max_new):
+            if input_ids.shape[1] == 0:
+                print("[WARNING] empty input, nothing to generate from.", file=sys.stderr)
+                break
+
+            try:
+                with torch.no_grad():
+                    out = self.model(input_ids=input_ids, past_key_values=past, use_cache=use_cache)
+            except Exception as e:
+                print(f"\n[ERROR at step {step}] {e}", file=sys.stderr)
+                break
+
+            logits = out.logits[0, -1]
+            past = out.past_key_values if use_cache else None
+
+            probs = torch.softmax(logits / TEMPERATURE, dim=-1)
+            next_id = torch.multinomial(probs, 1).item()
+
+            if next_id in self.stop_ids:
+                break
+
+            self.tokens.append(Token(id=next_id, role="assistant"))
+            generated_ids.append(next_id)
+            text = self.tokenizer.decode([next_id], skip_special_tokens=False)
+            print(text, end="", flush=True)
+
+            # next step only needs the new token
+            input_ids = torch.tensor([[next_id]], device=self.model.device)
+
+        print()
+        gen_end = len(self.tokens) - 1
+        content = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        self._log_turn("assistant", content)
+        self._close_assistant_turn(content)
+
+        if use_cache:
+            self._past_key_values = past
+            self._cache_len = len(self.tokens)
+
+        return gen_start, gen_end
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--window", type=int, default=DEFAULT_WINDOW,
+                        help="Sliding window size in tokens (0 = disabled, uses KV cache)")
+    parser.add_argument("--max-new", type=int, default=DEFAULT_MAX_NEW)
+    parser.add_argument("--log", default="conversation.log",
+                        help="Path to append conversation log (default: conversation.log)")
+    args = parser.parse_args()
+
+    log_path = Path(args.log)
+    print(f"Logging to {log_path.resolve()}")
+    chat = Chat(args.model, args.window, log_path)
+    status = "KV cache enabled" if chat.window_size == 0 else f"window={chat.window_size} tokens"
+    print(f"{status}. Type 'help' for commands.\n")
+
+    while True:
+        try:
+            user_input = input("[you] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
+            break
+
+        if not user_input:
+            continue
+
+        cmd = user_input.lower().split()
+
+        if cmd[0] == "quit":
+            print("Bye.")
+            break
+        elif cmd[0] == "help":
+            print(__doc__)
+        elif cmd[0] == "clear":
+            chat.tokens.clear()
+            chat.messages.clear()
+            chat._past_key_values = None
+            chat._cache_len = 0
+            chat._add_message("system", SYSTEM_PROMPT)
+            chat._log.write(f"\n[clear] {datetime.now().isoformat()}\n")
+            chat._log.flush()
+            print("Conversation cleared.")
+        elif cmd[0] == "window" and len(cmd) == 2:
+            n = int(cmd[1])
+            chat.window_size = n
+            chat._past_key_values = None  # invalidate cache when switching modes
+            chat._log.write(f"\n[window] {datetime.now().isoformat()} {n}\n")
+            chat._log.flush()
+            print(f"Window {'disabled (KV cache on)' if n == 0 else f'set to {n} tokens (KV cache off)'}.")
+        else:
+            chat.add_user(user_input)
+            start, end = chat.generate(args.max_new)
+            print(f"\n[tokens {start}-{end}]")
+
+
+if __name__ == "__main__":
+    main()
