@@ -18,6 +18,17 @@ The core idea: run a local LLM with a sliding context window so that as the mode
 pip install torch transformers accelerate bitsandbytes
 ```
 
+## Downloading the model
+
+`from_pretrained()` downloads automatically on first run, but HuggingFace recently migrated large repos to XetHub CAS storage — the Python client for it stalls on some networks and is significantly slower than a direct HTTP download. Use the provided script instead:
+
+```bash
+python3 download_model.py Qwen/Qwen2.5-7B-Instruct
+python3 download_model.py meta-llama/Llama-3.1-8B-Instruct  # any model
+```
+
+It uses `wget` with resume support (`-c`). Models are saved to `.models/<model-name>/`. We benchmarked wget against `snapshot_download`, `huggingface-cli download`, and `aria2c` — wget was fastest (~10 MB/s vs 2–3 MB/s for the Python paths). The root cause is documented in [xet-core#800](https://github.com/huggingface/xet-core/issues/800).
+
 ## Usage
 
 ```bash
