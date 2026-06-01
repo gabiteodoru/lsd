@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
-DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_MODEL = ".models/qwen2.5-7b-instruct"
 DEFAULT_WINDOW = 0
 DEFAULT_MAX_NEW = 512
 TEMPERATURE = 0.7
@@ -44,9 +44,26 @@ class Chat:
         self._add_message("system", SYSTEM_PROMPT)
 
     def _load(self, model_name: str):
+        model_path = Path(model_name)
+        if not model_path.exists():
+            # Try resolving HF ID (e.g. "Qwen/Qwen2.5-7B-Instruct") to local path
+            resolved = Path(".models") / model_name.split("/")[-1].lower()
+            if resolved.exists():
+                model_path = resolved
+                model_name = str(resolved)
+            else:
+                print(f"ERROR: model '{model_name}' not found locally.", file=sys.stderr)
+                print(f"Download it first with:", file=sys.stderr)
+                print(f"  python3 download_model.py {model_name}", file=sys.stderr)
+                sys.exit(1)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
-        use_4bit = vram_gb < 40
-        print(f"Loading {model_name} — VRAM: {vram_gb:.0f}GB, mode: {'4-bit quant' if use_4bit else 'bfloat16'} ...", flush=True)
+        shard_gb = sum(f.stat().st_size for f in model_path.glob("*.safetensors")) / 1e9
+        shard_gb = shard_gb or sum(f.stat().st_size for f in model_path.glob("*.bin")) / 1e9
+        if shard_gb * 0.25 > vram_gb:
+            print(f"ERROR: not enough VRAM for 4-bit ({vram_gb:.0f}GB available, need ~{shard_gb * 0.25:.0f}GB).", file=sys.stderr)
+            sys.exit(1)
+        use_4bit = shard_gb > vram_gb
+        print(f"Loading {model_name} — model: {shard_gb:.0f}GB, VRAM: {vram_gb:.0f}GB, mode: {'4-bit quant' if use_4bit else 'bfloat16'} ...", flush=True)
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             if use_4bit:
