@@ -9,6 +9,7 @@ Commands:
   <anything else>  send as next user message
 """
 
+import gc
 import sys
 import argparse
 import torch
@@ -64,6 +65,8 @@ class Chat:
             sys.exit(1)
         use_4bit = shard_gb > vram_gb
         print(f"Loading {model_name} — model: {shard_gb:.0f}GB, VRAM: {vram_gb:.0f}GB, mode: {'4-bit quant' if use_4bit else 'bfloat16'} ...", flush=True)
+        gc_thresholds = gc.get_threshold()
+        gc.set_threshold(100, 5, 5)
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             if use_4bit:
@@ -81,8 +84,12 @@ class Chat:
         except Exception as e:
             print(f"ERROR loading model: {e}", file=sys.stderr)
             raise
-        gc = self.model.generation_config
-        stop = gc.eos_token_id if gc.eos_token_id is not None else self.tokenizer.eos_token_id
+        finally:
+            gc.set_threshold(*gc_thresholds)
+            gc.collect()
+            torch.cuda.empty_cache()
+        gen_config = self.model.generation_config
+        stop = gen_config.eos_token_id if gen_config.eos_token_id is not None else self.tokenizer.eos_token_id
         self.stop_ids = set(stop if isinstance(stop, list) else [stop])
         print(f"Ready. stop_ids={self.stop_ids}\n")
 
@@ -165,8 +172,10 @@ class Chat:
             text = self.tokenizer.decode([next_id], skip_special_tokens=False)
             print(text, end="", flush=True)
 
-            # next step only needs the new token
-            input_ids = torch.tensor([[next_id]], device=self.model.device)
+            if use_cache:
+                input_ids = torch.tensor([[next_id]], device=self.model.device)
+            else:
+                input_ids = torch.tensor([self._context_ids()], device=self.model.device)
 
         print()
         gen_end = len(self.tokens) - 1
