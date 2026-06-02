@@ -93,7 +93,7 @@ class Chat:
         return self.tokenizer.encode(text, add_special_tokens=False)
 
     def _add_message(self, role: str, content: str):
-        before = self._tokenize_messages(self.messages)
+        before = self._tokenize_messages(self.messages) if self.messages else []
         self.messages.append({"role": role, "content": content})
         after = self._tokenize_messages(self.messages)
         self.tokens += [Token(id=i, role=role) for i in after[len(before):]]
