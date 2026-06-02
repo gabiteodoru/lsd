@@ -21,7 +21,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 DEFAULT_MODEL = ".models/qwen2.5-7b-instruct"
 DEFAULT_WINDOW = 0
-DEFAULT_MAX_NEW = 512
+DEFAULT_MAX_NEW = 0  # 0 = unlimited
 TEMPERATURE = 0.7
 SYSTEM_PROMPT = "You are a helpful assistant. Think through problems carefully and step by step."
 
@@ -146,7 +146,7 @@ class Chat:
             input_ids = torch.tensor([self._context_ids()], device=self.model.device)
             past = None
 
-        for step in range(max_new):
+        for step in (range(max_new) if max_new > 0 else iter(int, 1)):
             if input_ids.shape[1] == 0:
                 print("[WARNING] empty input, nothing to generate from.", file=sys.stderr)
                 break
@@ -195,7 +195,8 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW,
                         help="Sliding window size in tokens (0 = disabled, uses KV cache)")
-    parser.add_argument("--max-new", type=int, default=DEFAULT_MAX_NEW)
+    parser.add_argument("--max-new", type=int, default=DEFAULT_MAX_NEW,
+                        help="Max tokens to generate (0 = unlimited, default: 0)")
     parser.add_argument("--log", default="conversation.log",
                         help="Path to append conversation log (default: conversation.log)")
     args = parser.parse_args()
