@@ -57,28 +57,33 @@ class Chat:
                 print(f"Download it first with:", file=sys.stderr)
                 print(f"  python3 download_model.py {model_name}", file=sys.stderr)
                 sys.exit(1)
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
+        vram_gb = sum(
+            torch.cuda.get_device_properties(i).total_memory
+            for i in range(torch.cuda.device_count())
+        ) / 1e9 if torch.cuda.is_available() else 0
         shard_gb = sum(f.stat().st_size for f in model_path.glob("*.safetensors")) / 1e9
         shard_gb = shard_gb or sum(f.stat().st_size for f in model_path.glob("*.bin")) / 1e9
         if shard_gb * 0.25 > vram_gb:
             print(f"ERROR: not enough VRAM for 4-bit ({vram_gb:.0f}GB available, need ~{shard_gb * 0.25:.0f}GB).", file=sys.stderr)
             sys.exit(1)
-        use_4bit = shard_gb > vram_gb
-        print(f"Loading {model_name} — model: {shard_gb:.0f}GB, VRAM: {vram_gb:.0f}GB, mode: {'4-bit quant' if use_4bit else 'bfloat16'} ...", flush=True)
+        use_4bit = shard_gb * 2 > vram_gb  # need ~2x shard size for bf16; fp8 fits at ~1x
+        mode = "4-bit quant" if use_4bit else ("fp8/native" if shard_gb > vram_gb * 0.5 else "bfloat16")
+        print(f"Loading {model_name} — model: {shard_gb:.0f}GB, VRAM: {vram_gb:.0f}GB, mode: {mode} ...", flush=True)
         gc_thresholds = gc.get_threshold()
         gc.set_threshold(100, 5, 5)
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             if use_4bit:
                 bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_name, quantization_config=bnb, device_map="auto",
-                    low_cpu_mem_usage=True,
+                    low_cpu_mem_usage=True, trust_remote_code=True,
                 )
             else:
+                # torch_dtype="auto" preserves the checkpoint's native dtype (fp8 or bf16)
                 self.model = AutoModelForCausalLM.from_pretrained(
-                    model_name, torch_dtype=torch.bfloat16, device_map="auto",
-                    low_cpu_mem_usage=True,
+                    model_name, torch_dtype="auto", device_map="auto",
+                    low_cpu_mem_usage=True, trust_remote_code=True,
                 )
             self.model.eval()
         except Exception as e:
@@ -155,8 +160,20 @@ class Chat:
                 with torch.no_grad():
                     out = self.model(input_ids=input_ids, past_key_values=past, use_cache=use_cache)
             except Exception as e:
-                print(f"\n[ERROR at step {step}] {e}", file=sys.stderr)
-                break
+                if past is not None and step == 0:
+                    print(f"\n[WARNING] KV cache failed ({e}), retrying without cache ...", file=sys.stderr)
+                    use_cache = False
+                    past = None
+                    input_ids = torch.tensor([self._context_ids()], device=self.model.device)
+                    try:
+                        with torch.no_grad():
+                            out = self.model(input_ids=input_ids, past_key_values=None, use_cache=False)
+                    except Exception as e2:
+                        print(f"\n[ERROR at step {step}] {e2}", file=sys.stderr)
+                        break
+                else:
+                    print(f"\n[ERROR at step {step}] {e}", file=sys.stderr)
+                    break
 
             logits = out.logits[0, -1]
             past = out.past_key_values if use_cache else None
