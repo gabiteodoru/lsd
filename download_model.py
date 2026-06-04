@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Download a HuggingFace model using wget (resumable, fast).
-
-Uses huggingface_hub to list repo files, then wget -c for all downloads.
-This bypasses the XetHub CAS storage layer which is significantly slower
-on many networks. See: https://github.com/huggingface/xet-core/issues/800
+Download a HuggingFace model with parallel resumable downloads.
 
 Usage:
   python3 download_model.py
@@ -14,13 +10,25 @@ Usage:
 """
 
 import argparse
-import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+import requests
 from huggingface_hub import list_repo_tree
 from huggingface_hub.hf_api import RepoFile
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TaskID,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 
 HF_BASE = "https://huggingface.co"
+CHUNK = 1024 * 1024  # 1 MB
 
 
 def fmt_size(n: int) -> str:
@@ -31,12 +39,20 @@ def fmt_size(n: int) -> str:
     return f"{n:.1f} PB"
 
 
-def download(url: str, dest: Path):
-    print(f"  {dest.name}")
-    result = subprocess.run(["wget", "-c", "--show-progress", "-q", url, "-O", str(dest)])
-    if result.returncode != 0:
-        print(f"ERROR: wget failed for {url}", file=sys.stderr)
-        sys.exit(1)
+def download(url: str, dest: Path, size: int, progress: Progress, task_id: TaskID):
+    resume = dest.stat().st_size if dest.exists() else 0
+    if resume >= size:
+        progress.update(task_id, completed=size)
+        return
+
+    headers = {"Range": f"bytes={resume}-"} if resume else {}
+    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        progress.update(task_id, completed=resume)
+        with dest.open("ab" if resume else "wb") as f:
+            for chunk in r.iter_content(chunk_size=CHUNK):
+                f.write(chunk)
+                progress.update(task_id, advance=len(chunk))
 
 
 def main():
@@ -47,6 +63,8 @@ def main():
                         help="Output directory (default: .models/<model-name>)")
     parser.add_argument("--dry-run", action="store_true",
                         help="List files and total size without downloading")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Parallel shard downloads (default: 4)")
     args = parser.parse_args()
 
     model_id = args.model
@@ -78,13 +96,35 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     base_url = f"{HF_BASE}/{model_id}/resolve/main"
 
-    print(f"\nDownloading config/tokenizer files to {out_dir} ...")
-    for e in config:
-        download(f"{base_url}/{e.rfilename}", out_dir / e.rfilename)
+    progress = Progress(
+        TextColumn("[bold]{task.fields[name]}", justify="right"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+    )
 
-    print(f"\nDownloading model shards ({len(shards)} files) ...")
-    for e in shards:
-        download(f"{base_url}/{e.rfilename}", out_dir / e.rfilename)
+    with progress:
+        # Config files sequentially (fast, few files)
+        print(f"Downloading config/tokenizer files to {out_dir} ...")
+        for e in config:
+            size = e.size or 0
+            task_id = progress.add_task("download", name=e.rfilename, total=size)
+            download(f"{base_url}/{e.rfilename}", out_dir / e.rfilename, size, progress, task_id)
+
+        # Shards in parallel
+        print(f"\nDownloading model shards ({len(shards)} files, {args.workers} parallel) ...")
+        shard_tasks = {
+            e: progress.add_task("download", name=e.rfilename, total=e.size or 0)
+            for e in shards
+        }
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {
+                pool.submit(download, f"{base_url}/{e.rfilename}", out_dir / e.rfilename, e.size or 0, progress, shard_tasks[e]): e
+                for e in shards
+            }
+            for fut in as_completed(futures):
+                fut.result()
 
     print(f"\nDone. Model saved to: {out_dir.resolve()}")
     print(f"\nRun with:")
