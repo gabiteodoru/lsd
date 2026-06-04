@@ -115,12 +115,12 @@ def main():
         # Shards in parallel
         print(f"\nDownloading model shards ({len(shards)} files, {args.workers} parallel) ...")
         shard_tasks = {
-            e: progress.add_task("download", name=e.rfilename, total=e.size or 0)
+            e.rfilename: progress.add_task("download", name=e.rfilename, total=e.size or 0)
             for e in shards
         }
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {
-                pool.submit(download, f"{base_url}/{e.rfilename}", out_dir / e.rfilename, e.size or 0, progress, shard_tasks[e]): e
+                pool.submit(download, f"{base_url}/{e.rfilename}", out_dir / e.rfilename, e.size or 0, progress, shard_tasks[e.rfilename]): e
                 for e in shards
             }
             for fut in as_completed(futures):
