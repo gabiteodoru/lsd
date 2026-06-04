@@ -21,7 +21,6 @@ from rich.progress import (
     BarColumn,
     DownloadColumn,
     Progress,
-    TaskID,
     TextColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
@@ -39,20 +38,20 @@ def fmt_size(n: int) -> str:
     return f"{n:.1f} PB"
 
 
-def download(url: str, dest: Path, size: int, progress: Progress, task_id: TaskID):
+def download(url: str, dest: Path, size: int, progress: Progress):
     resume = dest.stat().st_size if dest.exists() else 0
     if resume >= size:
-        progress.update(task_id, completed=size)
         return
 
+    task_id = progress.add_task("download", name=dest.name, total=size, completed=resume)
     headers = {"Range": f"bytes={resume}-"} if resume else {}
     with requests.get(url, headers=headers, stream=True, timeout=60) as r:
         r.raise_for_status()
-        progress.update(task_id, completed=resume)
         with dest.open("ab" if resume else "wb") as f:
             for chunk in r.iter_content(chunk_size=CHUNK):
                 f.write(chunk)
                 progress.update(task_id, advance=len(chunk))
+    progress.remove_task(task_id)
 
 
 def main():
@@ -105,22 +104,14 @@ def main():
     )
 
     with progress:
-        # Config files sequentially (fast, few files)
         print(f"Downloading config/tokenizer files to {out_dir} ...")
         for e in config:
-            size = e.size or 0
-            task_id = progress.add_task("download", name=e.rfilename, total=size)
-            download(f"{base_url}/{e.rfilename}", out_dir / e.rfilename, size, progress, task_id)
+            download(f"{base_url}/{e.rfilename}", out_dir / e.rfilename, e.size or 0, progress)
 
-        # Shards in parallel
         print(f"\nDownloading model shards ({len(shards)} files, {args.workers} parallel) ...")
-        shard_tasks = {
-            e.rfilename: progress.add_task("download", name=e.rfilename, total=e.size or 0)
-            for e in shards
-        }
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {
-                pool.submit(download, f"{base_url}/{e.rfilename}", out_dir / e.rfilename, e.size or 0, progress, shard_tasks[e.rfilename]): e
+                pool.submit(download, f"{base_url}/{e.rfilename}", out_dir / e.rfilename, e.size or 0, progress): e
                 for e in shards
             }
             for fut in as_completed(futures):
