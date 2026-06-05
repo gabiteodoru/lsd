@@ -95,7 +95,7 @@ class Chat:
                     # in their native fp8 dtype when low_cpu_mem_usage=True (meta tensor path).
                     from transformers import AutoConfig
                     model_cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-                    model_cfg.quantization_config = None
+                    del model_cfg.quantization_config
                     extra = {"config": model_cfg}
                 else:
                     extra = {"torch_dtype": torch.bfloat16}
