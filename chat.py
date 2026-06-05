@@ -88,10 +88,19 @@ class Chat:
                     low_cpu_mem_usage=True, trust_remote_code=True,
                 )
             else:
-                # torch_dtype="auto" preserves the checkpoint's native dtype (fp8 or bf16)
+                extra = {}
+                if is_fp8:
+                    # transformers 4.46 doesn't recognize DeepSeek's "fp8" quant_method,
+                    # so strip it from the config and load weights in their native fp8 dtype
+                    from transformers import AutoConfig
+                    model_cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+                    model_cfg.quantization_config = None
+                    extra = {"config": model_cfg, "torch_dtype": torch.float8_e4m3fn}
+                else:
+                    extra = {"torch_dtype": torch.bfloat16}
                 self.model = AutoModelForCausalLM.from_pretrained(
-                    model_name, torch_dtype="auto", device_map="auto",
-                    low_cpu_mem_usage=True, trust_remote_code=True,
+                    model_name, device_map="auto",
+                    low_cpu_mem_usage=True, trust_remote_code=True, **extra,
                 )
             self.model.eval()
         except Exception as e:
