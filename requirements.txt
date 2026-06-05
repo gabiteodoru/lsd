@@ -1,4 +1,4 @@
 torch
-transformers
+transformers==4.46.3
 accelerate
 bitsandbytes

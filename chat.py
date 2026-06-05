@@ -63,11 +63,19 @@ class Chat:
         ) / 1e9 if torch.cuda.is_available() else 0
         shard_gb = sum(f.stat().st_size for f in model_path.glob("*.safetensors")) / 1e9
         shard_gb = shard_gb or sum(f.stat().st_size for f in model_path.glob("*.bin")) / 1e9
+        import json
+        cfg_path = model_path / "config.json"
+        is_fp8 = False
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text())
+            is_fp8 = cfg.get("quantization_config", {}).get("quant_method") == "fp8"
+        # fp8 loads at ~1x shard size; bf16 expands to ~2x
+        vram_multiplier = 1.0 if is_fp8 else 2.0
         if shard_gb * 0.25 > vram_gb:
             print(f"ERROR: not enough VRAM for 4-bit ({vram_gb:.0f}GB available, need ~{shard_gb * 0.25:.0f}GB).", file=sys.stderr)
             sys.exit(1)
-        use_4bit = shard_gb * 2 > vram_gb  # need ~2x shard size for bf16; fp8 fits at ~1x
-        mode = "4-bit quant" if use_4bit else ("fp8/native" if shard_gb > vram_gb * 0.5 else "bfloat16")
+        use_4bit = shard_gb * vram_multiplier > vram_gb
+        mode = "4-bit quant" if use_4bit else ("fp8/native" if is_fp8 else "bfloat16")
         print(f"Loading {model_name} — model: {shard_gb:.0f}GB, VRAM: {vram_gb:.0f}GB, mode: {mode} ...", flush=True)
         gc_thresholds = gc.get_threshold()
         gc.set_threshold(100, 5, 5)
