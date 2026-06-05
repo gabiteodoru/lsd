@@ -90,12 +90,13 @@ class Chat:
             else:
                 extra = {}
                 if is_fp8:
-                    # transformers 4.46 doesn't recognize DeepSeek's "fp8" quant_method,
-                    # so strip it from the config and load weights in their native fp8 dtype
+                    # transformers 4.46 doesn't recognize DeepSeek's "fp8" quant_method.
+                    # Strip it from config and omit torch_dtype — safetensors loads weights
+                    # in their native fp8 dtype when low_cpu_mem_usage=True (meta tensor path).
                     from transformers import AutoConfig
                     model_cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
                     model_cfg.quantization_config = None
-                    extra = {"config": model_cfg, "torch_dtype": torch.float8_e4m3fn}
+                    extra = {"config": model_cfg}
                 else:
                     extra = {"torch_dtype": torch.bfloat16}
                 self.model = AutoModelForCausalLM.from_pretrained(
